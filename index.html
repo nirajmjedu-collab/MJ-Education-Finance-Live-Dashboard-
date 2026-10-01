@@ -95,6 +95,7 @@ td.trunc{max-width:260px;overflow:hidden;text-overflow:ellipsis}
 tfoot td{font-weight:600;background:var(--head);position:sticky;bottom:0}
 .chip{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12.5px;font-weight:500;border:1px solid currentColor}
 .chip.ok{color:var(--ok)}.chip.warn{color:var(--warn)}.chip.info{color:var(--info)}.chip.mute{color:var(--muted)}
+.chip.bad{color:var(--bad)}
 .bar{display:block;height:6px;border-radius:3px;background:var(--brand);min-width:2px}
 .tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin:0 0 10px;color:var(--muted)}
 .tools .grp{display:flex;gap:8px;align-items:center}
@@ -234,9 +235,9 @@ const DATE_KEYS = ['dob','start','end','coe','invDate','received'];
 const MONEY_KEYS = ['courseFee','tuition','commission','gstAmt','total'];
 const normHeader = h => String(h).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
-function resolveCols(headers) {
+function resolveCols(headers, fields = FIELDS) {
   const norm = headers.map(normHeader), used = new Set(), map = {};
-  for (const [key, patterns] of Object.entries(FIELDS)) {
+  for (const [key, patterns] of Object.entries(fields)) {
     for (const re of patterns) {
       const i = norm.findIndex((h, idx) => !used.has(idx) && re.test(h));
       if (i >= 0) { map[key] = i; used.add(i); break; }
@@ -256,6 +257,7 @@ const S = {
 };
 const PAGES = {
   invoices:    { title: 'Invoices',    sub: 'Filter invoices by period on a cash or accrual basis.' },
+  coe:         { title: 'CoE Analysis', sub: 'Students, CoE issue dates and commission position from the Student_List table.' },
   overview:    { title: 'Overview',    sub: 'Commission totals and trends across the filtered records.' },
   commissions: { title: 'Commissions', sub: 'Every commission line. Select a row for the full record.' },
   colleges:    { title: 'Colleges',    sub: 'Commission earned per college.' },
@@ -418,7 +420,7 @@ async function refresh() {
 function setupTimer() {
   clearInterval(S.timer);
   const s = +settings().refreshSeconds;
-  if (s > 0) S.timer = setInterval(() => { if (!document.hidden) refresh(); }, s * 1000);
+  if (s > 0) S.timer = setInterval(() => { if (!document.hidden) { refresh(); if (currentPage() === 'coe') loadStudents(); } }, s * 1000);
 }
 
 /* ============================== SHELL ============================== */
@@ -452,7 +454,7 @@ function renderShell() {
     </main>
   </div>`;
   if ($('#signout')) $('#signout').onclick = () => msalApp.logoutRedirect({ account: S.account, postLogoutRedirectUri: redirectUri });
-  $('#refreshBtn').onclick = () => refresh();
+  $('#refreshBtn').onclick = () => { refresh(); if (currentPage() === 'coe') loadStudents(); };
   setStatus();
 }
 
@@ -482,10 +484,21 @@ function renderView(keepFocus) {
   const view = $('#view'); if (!view) return;
   const page = currentPage();
   const ae = document.activeElement;
-  const focusId = ae && (ae.id === 'q' || ae.id === 'invq') ? ae.id : null;
+  const focusId = ae && (ae.id === 'q' || ae.id === 'invq' || ae.id === 'coeq') ? ae.id : null;
   const q = focusId ? ae.selectionStart : null;
   destroyCharts();
   if (page === 'settings') { view.innerHTML = settingsHTML(); return; }
+  if (page === 'coe') {
+    if (!CO.loaded) {
+      if (!CO.loading && !CO.error) loadStudents();
+      view.innerHTML = CO.error ? coeErrorHTML(CO.error) : '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+      return;
+    }
+    view.innerHTML = coeFilterBar() + '<div id="results"></div>';
+    updateResults();
+    if (keepFocus && q != null && focusId) { const el = $('#' + focusId); if (el) { el.focus(); el.setSelectionRange(q, q); } }
+    return;
+  }
   if (!S.loaded) {
     view.innerHTML = S.error ? errorHTML(S.error) : S.needFile ? needFileHTML() : '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
     return;
@@ -545,6 +558,7 @@ function updateResults() {
   destroyCharts();
   const p = currentPage();
   if (p === 'invoices') return pInvoices(el);
+  if (p === 'coe') return pCoe(el);
   const rows = filtered();
   if (!rows.length) { el.innerHTML = '<div class="panel empty">No records match these filters. Clear a filter or change the search.</div>'; return; }
   ({ overview: pOverview, commissions: pCommissions, colleges: pColleges, agents: pAgents })[p](rows, el);
@@ -703,6 +717,8 @@ function settingsHTML() {
       <label>Workbook link<textarea id="setUrl" spellcheck="false">${esc(c.fileUrl)}</textarea></label>
       <label>Table${S.tables.length ? '' : ' (found after the first load)'}
         <select id="setTable"><option value="">First table in the workbook</option>${S.tables.map(t => `<option${t === c.table ? ' selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
+      <label>CoE Analysis table
+        <select id="setStudentTable"><option value="">Student_List (default)</option>${S.tables.map(t => `<option${t === c.studentTable ? ' selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
       <label>Refresh every
         <select id="setRefresh">${[[15,'15 seconds'],[30,'30 seconds'],[60,'1 minute'],[300,'5 minutes'],[0,'Never (manual only)']].map(([v, l]) => `<option value="${v}"${+c.refreshSeconds === v ? ' selected' : ''}>${l}</option>`).join('')}</select></label>
       <div><button class="btn primary" data-act="save">Save and reload</button></div>
@@ -714,6 +730,7 @@ function settingsHTML() {
       <div>Signed in as</div><div>${esc(S.account?.username || '')}</div>
       <div>Redirect address</div><div><code>${esc(redirectUri)}</code></div></div></div>
     <div class="panel"><h3>Column matching</h3><p style="color:var(--muted);margin-top:0">Columns are found by heading, so you can reorder them in Excel. Renaming a heading may break the match.</p><div class="kv">${map}</div></div>
+    ${coeMapHTML()}
   </div>`;
 }
 
@@ -911,14 +928,228 @@ function openInvoice(key) {
   d.classList.add('wide', 'open'); d.setAttribute('aria-hidden', 'false');
 }
 
+/* ============================== COE ANALYSIS (separate Student_List table) ============================== */
+// Everything below is additive: it has its own state (CO), its own column map and its own table.
+// The invoice reports above never read from it.
+const STU_FIELDS = {
+  status:[/^status$/], year:[/^year$/], locType:[/^location type/], parentAgent:[/^parent agent/], subAgent:[/^sub ?agent/], branch:[/^branch/],
+  college:[/^college/], campus:[/^campus/], dob:[/^dob$/, /^date of birth/], studentId:[/^student id/], student:[/^student name/], course:[/^course name/],
+  start:[/^start date/], end:[/^end date/], coe:[/^coe/], courseFee:[/^course fee/], claimable:[/^claimable tuition/], rate:[/^commission rate/],
+  eligible:[/^eligible commission/], received:[/^commission received/], bad:[/^bad debt commission/], pending:[/^pending commission/],
+  eligBonus:[/^eligible bonus/], bonusRecv:[/^bonus received/], badBonus:[/^bad debt bonus/], pendBonus:[/^pending bonus/],
+  invoices:[/^invoices/], lastUpdated:[/^last updated/], remarks:[/^remarks?$/], monthsLeft:[/^months left/],
+  dueAfter:[/^commission due after/, /^commision due after/],
+};
+const CO = { rows: [], headers: [], colMap: {}, tableName: '', tableKey: '', tableId: '', loaded: false, loading: false, error: null, sig: '', updated: null,
+  f: { coe: '', year: '', month: '', status: '', college: '', agent: '', q: '' } };
+
+const fmtRate = v => typeof v === 'number' ? (v <= 1.5 ? (v * 100).toFixed(2) : v.toFixed(2)) + '%' : str(v);
+
+function processStudents(values) {
+  if (!values || !values.length) throw Object.assign(new Error('The CoE table is empty.'), { code: 'NO_DATA' });
+  const headers = values[0].map(h => str(h));
+  const colMap = resolveCols(headers, STU_FIELDS);
+  const idx = keys => new Set(keys.map(k => colMap[k]).filter(i => i != null));
+  const dateIdx = idx(['dob', 'start', 'end', 'coe', 'lastUpdated']);
+  const moneyIdx = idx(['courseFee', 'claimable', 'eligible', 'received', 'bad', 'pending', 'eligBonus', 'bonusRecv', 'badBonus', 'pendBonus', 'dueAfter']);
+  const rows = [];
+  for (const r of values.slice(1)) {
+    const g = k => colMap[k] != null ? r[colMap[k]] : '';
+    const rate = g('rate');
+    const rec = {
+      status: str(g('status')), parentAgent: str(g('parentAgent')), subAgent: str(g('subAgent')), college: str(g('college')),
+      student: str(g('student')), studentId: str(g('studentId')), course: str(g('course')),
+      coe: toDate(g('coe')), start: toDate(g('start')),
+      courseFee: num(g('courseFee')), claimable: num(g('claimable')), rate: typeof rate === 'number' ? rate : null,
+      eligible: num(g('eligible')), received: num(g('received')), pending: num(g('pending')),
+      eligBonus: num(g('eligBonus')), bonusRecv: num(g('bonusRecv')), pendBonus: num(g('pendBonus')),
+    };
+    if (!rec.student && !rec.college && !rec.studentId) continue;          // skip empty/formula-only rows
+    rec.id = rows.length;
+    rec.cells = headers.map((h, ci) => dateIdx.has(ci) ? fmtDate(toDate(r[ci]))
+      : moneyIdx.has(ci) ? (typeof r[ci] === 'number' ? fm(r[ci]) : str(r[ci]))
+      : ci === colMap.rate ? fmtRate(r[ci]) : r[ci] ?? '');
+    rec.search = rec.cells.join(' ').toLowerCase();
+    rows.push(rec);
+  }
+  return { headers, colMap, rows };
+}
+
+async function loadStudents() {
+  if (!CONFIG.authRequired) {
+    CO.error = Object.assign(new Error('CoE Analysis reads the Student_List table from SharePoint, so it needs the live Microsoft sign-in.'), { code: 'NEEDS_LIVE' });
+    return;
+  }
+  if (CO.loading) return;
+  CO.loading = true;
+  try {
+    const cfg = settings();
+    const want = cfg.studentTable || 'Student_List';
+    const ref = await resolveFile(cfg.fileUrl);
+    const base = `/drives/${ref.driveId}/items/${ref.itemId}/workbook`;
+    const key = ref.itemId + '|' + want;
+    if (CO.tableKey !== key) {
+      const tabs = (await graph(`${base}/tables?$select=id,name`)).value || [];
+      S.tables = tabs.map(t => t.name);
+      const norm = n => String(n).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const t = tabs.find(t => t.name === want) || tabs.find(t => norm(t.name) === norm(want))
+        || tabs.find(t => /student/i.test(t.name) && t.name !== S.tableName);
+      if (!t) throw Object.assign(new Error(`No table named "${want}" was found. Tables in the workbook: ${tabs.map(t => t.name).join(', ') || 'none'}. Pick the right one in Settings.`), { code: 'NO_TABLE' });
+      CO.tableKey = key; CO.tableId = t.id; CO.tableName = t.name;
+    }
+    const r = await graph(`${base}/tables/${encodeURIComponent(CO.tableId)}/range?$select=values`);
+    const sig = JSON.stringify(r.values);
+    if (sig !== CO.sig || !CO.loaded) {
+      Object.assign(CO, processStudents(r.values));
+      CO.sig = sig; CO.loaded = true;
+    }
+    CO.error = null; CO.updated = new Date();
+  } catch (e) {
+    CO.error = e;
+    CO.tableKey = '';
+  } finally {
+    CO.loading = false;
+    if (currentPage() === 'coe') renderView(true);
+  }
+}
+
+function coeErrorHTML(e) {
+  let title = 'Could not load the CoE table', body = e.message;
+  if (e.code === 'NO_TABLE') title = 'CoE table not found';
+  else if (e.code === 'NEEDS_LIVE') title = 'Live connection needed';
+  else if (e.status === 401 || e.status === 403) body = 'Microsoft Graph refused to read this table. Check that your account can open the workbook in SharePoint.';
+  return `<div class="notice"><h2>${esc(title)}</h2><p>${esc(body)}</p>${e.status ? `<p><code>HTTP ${e.status}${e.code ? ' ' + esc(e.code) : ''}</code></p>` : ''}
+    <div class="row"><button class="btn primary" data-act="coeretry">Try again</button><a class="btn" href="#/settings" style="text-decoration:none">Open settings</a></div></div>`;
+}
+
+function coeChip(t) {
+  if (!t) return '';
+  const l = t.toLowerCase();
+  const cls = /withdraw|cancel/.test(l) ? 'bad' : /complete/.test(l) ? 'info' : /active/.test(l) ? 'ok' : 'mute';
+  return `<span class="chip ${cls}">${esc(t)}</span>`;
+}
+
+function coeFilterBar() {
+  const f = CO.f;
+  const uq = k => [...new Set(CO.rows.map(r => r[k]).filter(Boolean))].sort(natural).map(v => [v, v]);
+  const yrs = [...new Set(CO.rows.filter(r => r.coe).map(r => String(r.coe.getUTCFullYear())))].sort().reverse().map(y => [y, y]);
+  const sel = (key, label, opts) => `<label class="f"><span>${label}</span><select data-coef="${key}"><option value="">All</option>${opts.map(([v, l]) => `<option value="${esc(v)}"${v === f[key] ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`;
+  return `<div class="filters">
+    ${sel('coe', 'CoE', [['issued', 'CoE issued'], ['none', 'No CoE yet']])}
+    ${sel('year', 'CoE year', yrs)}
+    ${sel('month', 'CoE month', MONTHS.map((m, i) => [String(i + 1), m]))}
+    ${sel('status', 'Status', uq('status'))}
+    ${sel('college', 'College', uq('college'))}
+    ${sel('agent', 'Parent agent', uq('parentAgent'))}
+    <label class="f grow"><span>Search</span><input id="coeq" type="search" placeholder="Student, course, student ID…" value="${esc(f.q)}"></label>
+    <button class="btn ghost" data-act="coeclear">Clear filters</button></div>`;
+}
+
+function coeFiltered() {
+  const f = CO.f, q = f.q.trim().toLowerCase();
+  return CO.rows.filter(r => {
+    if (f.coe === 'issued' && !r.coe) return false;
+    if (f.coe === 'none' && r.coe) return false;
+    if (f.year || f.month) {
+      if (!r.coe) return false;
+      if (f.year && String(r.coe.getUTCFullYear()) !== f.year) return false;
+      if (f.month && String(r.coe.getUTCMonth() + 1) !== f.month) return false;
+    }
+    if (f.status && r.status !== f.status) return false;
+    if (f.college && r.college !== f.college) return false;
+    if (f.agent && r.parentAgent !== f.agent) return false;
+    return !q || r.search.includes(q);
+  });
+}
+
+function pCoe(el) {
+  const rows = coeFiltered();
+  if (!rows.length) { el.innerHTML = '<div class="panel empty">No students match these filters. Clear a filter or change the search.</div>'; return; }
+  const withCoe = rows.filter(r => r.coe).length;
+  const cl = sum(rows, 'claimable'), el$ = sum(rows, 'eligible'), rc = sum(rows, 'received'), pe = sum(rows, 'pending');
+  const pct = el$ ? Math.round(rc / el$ * 100) : 0;
+  el.innerHTML = `
+  <div class="ledger">
+    <div class="big"><div class="lbl">Students</div><div class="val">${rows.length}</div><div class="sub">${withCoe} with CoE issued, ${rows.length - withCoe} without</div></div>
+    <div><div class="lbl">Claimable tuition</div><div class="val">${fm(cl)}</div></div>
+    <div><div class="lbl">Eligible commission</div><div class="val">${fm(el$)}</div></div>
+    <div><div class="lbl">Commission received</div><div class="val">${fm(rc)}</div><div class="sub">${pct}% of eligible</div></div>
+    <div><div class="lbl">Pending commission</div><div class="val">${fm(pe)}</div></div>
+  </div>
+  <div class="grid">
+    <div class="panel s8"><h3>CoEs issued by month</h3><div class="chart"><canvas id="k1"></canvas></div></div>
+    <div class="panel s4"><h3>Students by status</h3><div class="chart"><canvas id="k2"></canvas></div></div>
+    <div class="panel s7"><h3>Top colleges by eligible commission</h3><div class="chart"><canvas id="k3"></canvas></div></div>
+    <div class="panel s5"><h3>Eligible vs received, by CoE year</h3><div class="chart"><canvas id="k4"></canvas></div></div>
+  </div>
+  <div id="coetable" style="margin-top:16px"></div>`;
+
+  const months = [...groupBy(rows.filter(r => r.coe), r => monthKey(r.coe))].sort((a, b) => a[0].localeCompare(b[0]));
+  draw('k1', { type: 'bar', data: { labels: months.map(m => monthLabel(m[0])), datasets: [{ data: months.map(m => m[1].length), backgroundColor: PALETTE[0], borderRadius: 3 }] },
+    options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => ` ${c.raw} CoEs` } } },
+      scales: { y: { ticks: { precision: 0 }, grid: { color: css('--line') }, border: { display: false } }, x: { grid: { display: false } } } } });
+
+  const st = [...groupBy(rows, r => r.status || '(blank)')].map(([k, v]) => [k, v.length]).sort((a, b) => b[1] - a[1]);
+  draw('k2', { type: 'doughnut', data: { labels: st.map(s => s[0]), datasets: [{ data: st.map(s => s[1]), backgroundColor: PALETTE, borderColor: css('--panel'), borderWidth: 2 }] },
+    options: { cutout: '62%', plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: c => ` ${c.label}: ${c.raw}` } } } } });
+
+  const col = [...groupBy(rows, r => r.college || '(blank)')].map(([k, v]) => [k, sum(v, 'eligible')]).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  draw('k3', { type: 'bar', data: { labels: col.map(c => clip(c[0], 30)), datasets: [{ data: col.map(c => c[1]), backgroundColor: PALETTE[0], borderRadius: 3 }] },
+    options: { indexAxis: 'y', plugins: { legend: { display: false }, tooltip: tipMoney }, scales: { x: axisMoney, y: { grid: { display: false } } } } });
+
+  const yrs = [...groupBy(rows, r => r.coe ? String(r.coe.getUTCFullYear()) : 'No CoE')].sort((a, b) => a[0].localeCompare(b[0]));
+  draw('k4', { type: 'bar', data: { labels: yrs.map(y => y[0]), datasets: [
+      { label: 'Eligible', data: yrs.map(y => sum(y[1], 'eligible')), backgroundColor: PALETTE[0], borderRadius: 3 },
+      { label: 'Received', data: yrs.map(y => sum(y[1], 'received')), backgroundColor: PALETTE[1], borderRadius: 3 }] },
+    options: { plugins: { legend: { position: 'bottom' }, tooltip: tipMoney }, scales: { y: axisMoney, x: { grid: { display: false } } } } });
+
+  const cols = [
+    { key: 'st', label: 'Student', val: r => r.student },
+    { key: 'co', label: 'College', val: r => r.college, trunc: true },
+    { key: 'cr', label: 'Course', val: r => r.course, trunc: true },
+    { key: 'ss', label: 'Status', val: r => r.status, html: r => coeChip(r.status) },
+    { key: 'cd', label: 'CoE issued', val: r => r.coe?.getTime() || 0, html: r => esc(fmtDate(r.coe)) },
+    { key: 'sd', label: 'Start date', val: r => r.start?.getTime() || 0, html: r => esc(fmtDate(r.start)) },
+    { key: 'cl', label: 'Claimable tuition', num: true, val: r => r.claimable, fmt: fm },
+    { key: 'rt', label: 'Rate', num: true, val: r => r.rate, fmt: v => v == null ? '' : fmtRate(v) },
+    { key: 'el', label: 'Eligible', num: true, val: r => r.eligible, fmt: fm },
+    { key: 'rc', label: 'Received', num: true, val: r => r.received, fmt: fm },
+    { key: 'pe', label: 'Pending', num: true, val: r => r.pending, fmt: fm },
+  ];
+  const t = dataTable('coe', cols, rows, { page: true, rowAttr: r => ` data-stu="${r.id}"`, defaultSort: { key: 'cd', dir: 'desc' },
+    foot: { st: 'Total', cl: fm(cl), el: fm(el$), rc: fm(rc), pe: fm(pe) } });
+  const pages = Math.max(1, Math.ceil(t.total / CONFIG.pageSize));
+  if (S.pageNo >= pages) S.pageNo = pages - 1;
+  $('#coetable').innerHTML = `<div class="tools"><div>${t.total} students. Select a row for the full record.</div></div>${t.html}
+    <div class="tools"><div>Page ${S.pageNo + 1} of ${pages}</div>
+      <div class="grp"><button class="btn" data-pg="-1"${S.pageNo === 0 ? ' disabled' : ''}>Previous</button><button class="btn" data-pg="1"${S.pageNo >= pages - 1 ? ' disabled' : ''}>Next</button></div></div>`;
+}
+
+function openStudent(id) {
+  const r = CO.rows.find(x => x.id === id); if (!r) return;
+  const d = $('#drawer');
+  d.innerHTML = `<header><div><h2>${esc(r.student || 'Student')}</h2><div style="color:var(--muted)">${esc(r.college)}</div></div><button class="btn" data-act="close">Close</button></header>
+    <div class="body"><dl>${CO.headers.map((h, i) => `<dt>${esc(h || 'Column ' + (i + 1))}</dt><dd>${esc(r.cells[i])}</dd>`).join('')}</dl></div>`;
+  d.classList.remove('wide'); d.classList.add('open'); d.setAttribute('aria-hidden', 'false');
+}
+
+function coeMapHTML() {
+  const names = { status: 'Status', parentAgent: 'Parent agent', college: 'College name', student: 'Student name', studentId: 'Student ID', course: 'Course name',
+    coe: 'CoE issued date', start: 'Start date', claimable: 'Claimable tuition fee', rate: 'Commission rate', eligible: 'Eligible commission',
+    received: 'Commission received', pending: 'Pending commission' };
+  if (!CO.loaded) return '<div class="panel"><h3>CoE table</h3><p style="color:var(--muted);margin:0">Open the CoE Analysis page once to load the table and see how its columns were matched.</p></div>';
+  return `<div class="panel"><h3>CoE table: ${esc(CO.tableName)}</h3><p style="color:var(--muted);margin-top:0">${CO.rows.length} students.</p><div class="kv">${
+    Object.entries(names).map(([k, l]) => { const i = CO.colMap[k]; return `<div>${l}</div><div>${i != null ? `<code>${esc(CO.headers[i])}</code>` : '<span class="miss">Not found. Check the column heading.</span>'}</div>`; }).join('')}</div></div>`;
+}
+
 /* ============================== EVENTS ============================== */
 let qTimer;
 document.addEventListener('input', e => {
   const id = e.target.id;
-  if (id !== 'q' && id !== 'invq') return;
+  if (id !== 'q' && id !== 'invq' && id !== 'coeq') return;
   clearTimeout(qTimer);
   qTimer = setTimeout(() => {
-    if (id === 'q') S.filters.q = e.target.value; else S.inv.invNo = e.target.value;
+    if (id === 'q') S.filters.q = e.target.value; else if (id === 'coeq') CO.f.q = e.target.value; else S.inv.invNo = e.target.value;
     S.pageNo = 0; updateResults();
   }, 150);
 });
@@ -926,6 +1157,7 @@ document.addEventListener('change', e => {
   const t = e.target;
   if (t.id === 'filePick') { pickFile(t.files[0]); t.value = ''; return; }
   if (t.dataset.inv) { S.inv[t.dataset.inv] = t.value; updateResults(); return; }
+  if (t.dataset.coef) { CO.f[t.dataset.coef] = t.value; S.pageNo = 0; updateResults(); return; }
   if (t.id === 'invsort') { S.sort.invoices = { key: t.value, dir: S.sort.invoices.dir }; updateResults(); return; }
   if (t.dataset.filter) { S.filters[t.dataset.filter] = t.value; S.pageNo = 0; updateResults(); }
   else if (t.dataset.act === 'allcols') { S.allCols = t.checked; S.pageNo = 0; updateResults(); }
@@ -933,6 +1165,8 @@ document.addEventListener('change', e => {
 document.addEventListener('click', e => {
   const bs = e.target.closest('[data-basis]');
   if (bs) { S.inv.basis = bs.dataset.basis; renderView(); return; }
+  const sr = e.target.closest('[data-stu]');
+  if (sr) return openStudent(+sr.dataset.stu);
   const ir = e.target.closest('[data-invrow]');
   if (ir) return openInvoice(decodeURIComponent(ir.dataset.invrow));
   const th = e.target.closest('[data-sort]');
@@ -948,13 +1182,16 @@ document.addEventListener('click', e => {
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (act === 'invdir') { const s = S.sort.invoices; s.dir = s.dir === 'asc' ? 'desc' : 'asc'; syncInvSort(); updateResults(); }
   else if (act === 'invclear') { S.inv = { basis: S.inv.basis, year: '', month: '', invNo: '', college: '', commStatus: '', payStatus: '' }; renderView(); }
+  else if (act === 'coeclear') { CO.f = { coe: '', year: '', month: '', status: '', college: '', agent: '', q: '' }; S.pageNo = 0; renderView(); }
+  else if (act === 'coeretry') { CO.error = null; loadStudents(); renderView(); }
   else if (act === 'pick') { const fp = $('#filePick'); if (fp) fp.click(); }
   else if (act === 'clear') { S.filters = { year: '', commStatus: '', payStatus: '', college: '', q: '' }; S.pageNo = 0; renderView(); }
   else if (act === 'csv') downloadCsv();
   else if (act === 'close') closeDrawer();
   else if (act === 'retry') { S.error = null; refresh(); }
   else if (act === 'save') {
-    store.set({ fileUrl: $('#setUrl').value.trim() || CONFIG.defaultFileUrl, table: $('#setTable').value, refreshSeconds: +$('#setRefresh').value });
+    store.set({ fileUrl: $('#setUrl').value.trim() || CONFIG.defaultFileUrl, table: $('#setTable').value, studentTable: $('#setStudentTable') ? $('#setStudentTable').value : '', refreshSeconds: +$('#setRefresh').value });
+    CO.loaded = false; CO.error = null; CO.sig = ''; CO.tableKey = '';
     fileRef = null; S.loaded = false; S.rawSig = ''; S.error = null; sessionStorage.removeItem('fld.sitesTried');
     setupTimer(); location.hash = '#/invoices'; refresh();
   }
